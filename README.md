@@ -1,19 +1,20 @@
-# claude-cli → OpenAI 兼容 API
+# claude-cli → OpenAI-compatible API
 
-把本地登录的 `claude` CLI 包成 OpenAI 兼容协议的 HTTP 服务，支持并发、重试、流式。
+Wraps a locally-logged-in `claude` CLI as an OpenAI-compatible HTTP service. Adds concurrency, retry, streaming, and an optional session-based mode that keeps the prompt cache warm.
 
-> English version: [README.en.md](./README.en.md)
+> 中文版: see [README.md](./README.md)
 
-## 快速开始
+## Quick start
 
 ```bash
 pip install -r requirements.txt
-python claude_api.py            # 起服务: http://127.0.0.1:8765
-python parallel_client_demo.py  # 另开终端, 跑并行示例
-python multi_turn_demo.py       # 多轮对话示例
+python claude_api.py            # serves http://127.0.0.1:8765
+python parallel_client_demo.py  # in another terminal: parallel calls
+python multi_turn_demo.py       # stateless multi-turn chat
+python session_demo.py          # session-based multi-turn (cache-friendly)
 ```
 
-OpenAI SDK 直接指过去：
+Point any OpenAI SDK at it:
 
 ```python
 from openai import OpenAI
@@ -27,66 +28,66 @@ print(r.choices[0].message.content)
 
 ---
 
-## 模型名称怎么选
+## Choosing a model name
 
-`claude` CLI 的 `--model` 参数支持几种"别名"和完整 ID。直接抄 [官方文档](https://code.claude.com/docs/en/model-config) 的表：
+The `claude` CLI's `--model` flag accepts a few aliases plus full IDs. Straight from the [official docs](https://code.claude.com/docs/en/model-config):
 
-| Model alias | 行为 |
+| Model alias  | Behavior |
 |---|---|
-| `default` | 特殊值，清除任何 model 覆盖，回到账号类型对应的推荐模型（本身不是模型别名） |
-| `best` | 当前最强模型，目前等于 `opus` |
-| `sonnet` | 最新 Sonnet，适合日常 coding |
-| `opus` | 最新 Opus，适合复杂推理 |
-| `haiku` | 最新 Haiku，快、便宜，适合简单任务 |
-| `sonnet[1m]` | Sonnet 1M 上下文窗口，适合长对话/长文档 |
-| `opus[1m]` | Opus 1M 上下文窗口 |
-| `opusplan` | 计划阶段用 opus，执行阶段切到 sonnet |
+| `default`    | Special value that clears any model override and reverts to the recommended model for your account type. Not itself a model alias. |
+| `best`       | Most capable available model, currently equivalent to `opus`. |
+| `sonnet`     | Latest Sonnet model for daily coding tasks. |
+| `opus`       | Latest Opus model for complex reasoning. |
+| `haiku`      | Fast, cheap Haiku for simple tasks. |
+| `sonnet[1m]` | Sonnet with a 1M-token context window for long sessions. |
+| `opus[1m]`   | Opus with a 1M-token context window. |
+| `opusplan`   | Uses Opus during plan mode, Sonnet for execution. |
 
-也可以传**完整 ID**（如 `claude-sonnet-4-6`）钉死某个具体版本。这些值都直接透传给 `claude --model`。
+You can also pass a **full model ID** (e.g. `claude-sonnet-4-6`) to pin a specific version. Anything you send is forwarded to `claude --model` as-is.
 
-### 服务端的额外约定
+### Server-side conventions
 
-为了配合 OpenAI 客户端必填 `model` 字段的硬性要求，本服务对几个"占位字符串"做了识别：
+To play nicely with OpenAI clients that *require* a `model` field, the server treats a few placeholder strings specially:
 
-- `default` / `auto` / `claude` / `claude-cli` / 空字符串 → **不**给 CLI 加 `--model`，直接走账号默认（和官方 `default` 别名行为一致）
-- 其它任何字符串原样透传给 `claude --model`，由 CLI 校验
+- `default` / `auto` / `claude` / `claude-cli` / empty string → **no** `--model` flag is added; the CLI uses your account default (matches the official `default` alias behaviour)
+- Anything else is forwarded verbatim, validated by the CLI
 
-实操建议：
+Practical guidance:
 
-- **不知道选啥**：填 `default`，跟着账号走
-- **想要最快**：填 `haiku`
-- **想要最强**：填 `opus` 或 `best`
-- **长对话/塞大段文档**：填 `sonnet[1m]`
-- **想钉死版本不被悄悄升级**：填完整 ID，比如 `claude-sonnet-4-6`
+- **Don't know what to pick** → `default`, follow your account
+- **Want speed/cheap** → `haiku`
+- **Want the strongest** → `opus` or `best`
+- **Long conversations / big docs** → `sonnet[1m]`
+- **Pin a specific snapshot** → use a full ID like `claude-sonnet-4-6`
 
-确认你这台机器上的 CLI 真的支持某个值，可以直接试一下：
-
-```bash
-echo "ping" | claude -p --model sonnet --output-format json | head
-# 看返回里 "is_error" 是 false 还是 true
-```
-
-或者环境变量配个全局默认，客户端就可以一直传 `default`：
+You can also set a global default via env var so clients can keep sending `default`:
 
 ```bash
 CLAUDE_DEFAULT_MODEL=sonnet[1m] python claude_api.py
 ```
 
+To verify what your local CLI version actually accepts:
+
+```bash
+echo "ping" | claude -p --model sonnet --output-format json | head
+# look at "is_error" in the response
+```
+
 ---
 
-## 多轮对话怎么做
+## Multi-turn conversations
 
-有两种风格，**推荐第一种**（和 OpenAI API 完全一致）。
+Two styles. **Method 1 is the default and matches OpenAI exactly.**
 
-### 方式 1（推荐）：客户端维护历史，每次发完整 messages
+### Method 1: stateless — client keeps the history, sends full `messages` each call
 
-服务端是无状态的——它把整个 `messages` 数组拼成一段 `User: ... / Assistant: ...` 对话送给 CLI。所以你像用 OpenAI 那样在 client 端追加历史就行：
+The server is stateless. It concatenates your messages into a `User: ... / Assistant: ...` block and pipes it to the CLI. You just maintain history on the client side as you would with the real OpenAI API:
 
 ```python
 from openai import OpenAI
 client = OpenAI(base_url="http://127.0.0.1:8765/v1", api_key="x")
 
-history = [{"role": "system", "content": "你是一个简洁的中文助手。"}]
+history = [{"role": "system", "content": "You are a concise assistant."}]
 
 def chat(user_msg: str) -> str:
     history.append({"role": "user", "content": user_msg})
@@ -95,25 +96,24 @@ def chat(user_msg: str) -> str:
     history.append({"role": "assistant", "content": reply})
     return reply
 
-print(chat("我叫张三"))
-print(chat("我刚才说我叫什么?"))   # 模型能正确回忆
+print(chat("My name is Alice"))
+print(chat("What did I just tell you my name was?"))   # remembers
 ```
 
-优点：
+Pros:
+- Clean protocol; works with every OpenAI client and framework (LangChain, LlamaIndex, open-webui, LobeChat, etc.)
+- Stateless server, concurrency-friendly
+- You control the history — easy to prune, fork, or splice in tool results
 
-- 协议干净，所有 OpenAI 客户端 / 框架（LangChain、LlamaIndex、open-webui、LobeChat 等）天然兼容
-- 服务端无状态，并发友好
-- 历史完全在你手里，想剪枝、想分叉、想注入工具结果都方便
+Cons: every call resends the full history, which gets expensive on long conversations. Also, the dialog history portion does **not** get prompt-cache hits (only the system prompt does), because the CLI sees one big user message rather than a real multi-message conversation.
 
-代价：每次都要把历史发一遍，长对话 token 用量高。如果聊得很久，可以做个 sliding window（保留最近 N 轮 + system）或者总结早期消息再放回 history。
+Full runnable example: [`multi_turn_demo.py`](./multi_turn_demo.py).
 
-完整可运行示例见 [`multi_turn_demo.py`](./multi_turn_demo.py)。
+### Method 2: pass a `session_id` — reuse the CLI session and prompt cache
 
-### 方式 2：传 `session_id` 复用 CLI 会话（享受 prompt cache）
+The server supports an **optional extension field** `session_id`. When you pass it, the server takes the native `--session-id` / `--resume` path: history lives inside the CLI, only the latest user message goes over the wire each turn, and the prompt prefix hits cache reliably.
 
-服务端支持一个**可选扩展字段** `session_id`。传了它就走 CLI 原生 `--session-id` / `--resume` 路径——历史由 CLI 端维护，每次只把最后一条 user 消息送过去，**前缀稳定命中 prompt cache**，长对话省 token 也省时。
-
-OpenAI Python SDK 用 `extra_body` 透传该字段（标准 OpenAI 客户端不会感知到，协议保持兼容）：
+OpenAI Python SDK forwards arbitrary fields via `extra_body` (vanilla OpenAI clients won't even notice — the protocol stays compatible):
 
 ```python
 import uuid
@@ -121,56 +121,56 @@ from openai import OpenAI
 
 client = OpenAI(base_url="http://127.0.0.1:8765/v1", api_key="x")
 
-SID = str(uuid.uuid4())   # 一段对话用一个
+SID = str(uuid.uuid4())   # one per conversation
 
 def chat(user_msg: str) -> str:
     r = client.chat.completions.create(
         model="default",
         messages=[{"role": "user", "content": user_msg}],
-        extra_body={"session_id": SID},        # <-- 关键
+        extra_body={"session_id": SID},        # <-- the key bit
     )
     return r.choices[0].message.content
 
-print(chat("我叫张三, 在深圳做后端"))
-print(chat("我刚说我在哪做什么?"))           # CLI 端自动续上, 享受缓存
+print(chat("My name is Alice and I'm a backend engineer in SF"))
+print(chat("Where did I say I work?"))         # CLI continues the session
 ```
 
-完整示例：[`session_demo.py`](./session_demo.py)（带 `cache_read_input_tokens` / `cache_creation_input_tokens` 打印，可以直接看到缓存收益）。
+Full runnable example: [`session_demo.py`](./session_demo.py). It prints `cache_read_input_tokens` / `cache_creation_input_tokens` per turn so you can see the cache benefit directly.
 
-#### 服务端的处理逻辑
+#### How the server handles `session_id`
 
-- 收到带 `session_id` 的请求 → 只取 `messages` 数组里**最后一条 user 消息**作为 prompt
-- 第一次见到该 `session_id`：用 `--session-id <id>`（带 `--system-prompt`）创建
-- 后续同一个 `session_id`：用 `--resume <id>`，**不再传** `--system-prompt`（session 已经有自己的 system）
-- CLI 报"session 不存在"（比如服务重启、CLI 端被清）→ 自动 fallback 重建
-- 同一 `session_id` 并发 → per-session `asyncio.Lock` 串行；不同 session 之间仍然并发
+- Request comes in with `session_id` → take only the **last user message** from `messages`, pass it as the prompt
+- First time we've seen this session_id → invoke with `--session-id <id>` (plus `--system-prompt` if any)
+- Subsequent calls with the same session_id → invoke with `--resume <id>`, **no** new `--system-prompt` (the session already has its own)
+- If the CLI says the session doesn't exist (server restart, on-disk session cleared) → automatic fallback to recreating it
+- Concurrent calls on the same session_id → serialized via a per-session `asyncio.Lock`. Different session_ids still run in parallel.
 
-#### 用法约束
+#### Constraints
 
-1. **同一 session 不能并发**：服务端会自动串行，但如果你期待并行，请用不同 session_id。
-2. **不能回滚/编辑历史**：CLI 的 session 是 append-only。想要 regenerate 或分叉，就开新 session_id。
-3. **二次调用的 system message 会被忽略**：第一次调用的 system 会绑死在 session 上，后续即使你在 messages 里改了 system，服务端也不会更新它（CLI 不支持中途换 system）。
-4. **session_id 必须是合法 UUID**：CLI 的 `--session-id` 要求 UUID 格式，建议直接 `uuid.uuid4()`。
+1. **One session at a time**: the server serializes for you. If you want parallelism, use multiple session_ids.
+2. **No history rewind / edits**: the CLI session is append-only. To regenerate or fork, start a new session_id.
+3. **System prompt is fixed at session creation**: if later requests change the `system` content, the server ignores it (the CLI doesn't support swapping the system prompt mid-session).
+4. **session_id must be a valid UUID**: required by `claude --session-id`. Just use `uuid.uuid4()`.
 
-#### 不传 `session_id` 的客户端行为不变
+#### Without `session_id`, nothing changes
 
-老调用完全不受影响，依然走方式 1 的无状态路径。两种方式可以混用——比如长对话用 session，独立的批量任务用无状态。
+Existing clients still work exactly as before via the stateless path. You can mix the two: long, sequential conversations on session_id, one-off batch tasks stateless.
 
 ---
 
-## 并发 / 重试 / 超时调优
+## Concurrency / retry / timeout tuning
 
-全部走环境变量，重启生效：
+All via env vars (restart to apply):
 
-| 环境变量 | 默认 | 说明 |
+| Variable | Default | Description |
 |---|---|---|
-| `CLAUDE_MAX_CONCURRENCY` | 4 | 同时跑几个 `claude` 子进程。账号容易触发限流就调小 |
-| `CLAUDE_TIMEOUT` | 300 | 单次 CLI 调用超时秒数，超时强制 kill 子进程 |
-| `CLAUDE_MAX_RETRIES` | 5 | 失败/超时重试次数 |
-| `CLAUDE_BASE_BACKOFF` | 2.0 | 退避基数，第 n 次等 `2 * 2^(n-1)` 秒，封顶 60 |
-| `CLAUDE_API_PORT` | 8765 | HTTP 端口 |
-| `CLAUDE_DEFAULT_MODEL` | (无) | 客户端传占位词时的全局默认值 |
-| `CLAUDE_BIN` | `claude` | CLI 可执行文件路径 |
+| `CLAUDE_MAX_CONCURRENCY` | 4 | Max simultaneous `claude` subprocesses. Lower it if your account hits rate limits often. |
+| `CLAUDE_TIMEOUT` | 300 | Per-call timeout in seconds. Subprocess is killed on timeout. |
+| `CLAUDE_MAX_RETRIES` | 5 | Retry attempts on failure / timeout. |
+| `CLAUDE_BASE_BACKOFF` | 2.0 | Base for exponential backoff. Attempt n waits `2 * 2^(n-1)` seconds, capped at 60. |
+| `CLAUDE_API_PORT` | 8765 | HTTP port. |
+| `CLAUDE_DEFAULT_MODEL` | (none) | Model used when the client sends a placeholder. |
+| `CLAUDE_BIN` | `claude` | Path to the CLI binary. |
 
 ```bash
 CLAUDE_MAX_CONCURRENCY=2 CLAUDE_MAX_RETRIES=8 python claude_api.py
@@ -178,9 +178,10 @@ CLAUDE_MAX_CONCURRENCY=2 CLAUDE_MAX_RETRIES=8 python claude_api.py
 
 ---
 
-## 已知限制
+## Known limitations
 
-- `temperature` / `top_p` / `max_tokens` 等参数在请求体里会被**忽略**（CLI 不暴露这些控制），但不会报错——纯做协议兼容。
-- 流式是"伪流式"：服务端拿到完整结果后切片成 SSE chunks 推。这样 retry 能在生成阶段完整生效，不会出现"半句话已经发出去再失败"。
-- 不做鉴权，建议只监听本机 `127.0.0.1`。要暴露到局域网请自己加反代 + token。
-# CLI2API
+- `temperature` / `top_p` / `max_tokens` and similar OpenAI knobs are **silently ignored** — the CLI doesn't expose them. The server accepts the fields purely for protocol compatibility.
+- Streaming is *pseudo-streaming*: the server collects the full response from the CLI, then slices it into SSE chunks. Upside: retry stays effective during generation — a half-emitted response can never get stuck mid-flight. Downside: you don't see token-by-token output as the model generates.
+- No auth. Bind to `127.0.0.1` only. If you need to expose it on a network, put a reverse proxy with a token in front.
+
+Sources: [Claude Code model configuration](https://code.claude.com/docs/en/model-config)
